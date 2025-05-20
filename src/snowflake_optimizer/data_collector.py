@@ -17,35 +17,29 @@ class SnowflakeDataCollector:
             self,
             account: str,
             user: str,
-            password: str,
             warehouse: str,
             database: Optional[str] = None,
             schema: Optional[str] = None,
     ):
-        """Initialize the collector with Snowflake credentials.
+        """Initialize the collector with Snowflake credentials using externalbrowser authentication."""
 
-        Args:
-            account: Snowflake account identifier
-            user: Snowflake username
-            password: Snowflake password
-            warehouse: Snowflake warehouse name
-            database: Optional database name
-            schema: Optional schema name
-        """
         self.__connection_params = {
             "account": account,
             "user": user,
-            "password": password,
+            "authenticator": "externalbrowser",  # Use browser-based SSO
             "warehouse": warehouse,
             "database": database,
             "schema": schema,
         }
-        self._engine = create_engine(
-            'snowflake://{user}:{password}@{account}/'.format(
-                **self.__connection_params
-            )
-        )
 
+        # Construct the SQLAlchemy connection URL
+        conn_url = (
+            f"snowflake://{user}@{account}/"
+            f"?authenticator=externalbrowser"
+        )
+        self._engine = create_engine(conn_url)
+
+        # Create Snowpark session generator
         self._snowpark_session_generator: Callable[[], Session] = lambda: Session.builder.configs(
             self.__connection_params).create()
 

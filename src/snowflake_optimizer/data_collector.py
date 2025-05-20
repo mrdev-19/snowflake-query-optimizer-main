@@ -1,4 +1,3 @@
-"""Module for collecting query performance data from Snowflake."""
 import collections
 import time
 from typing import Dict, Any, Optional, Literal, Callable, List
@@ -49,10 +48,10 @@ class QueryMetricsCollector(SnowflakeDataCollector):
 
     def get_databases(self):
         query = """
-        select database_name 
-        from snowflake.account_usage.databases 
-        where deleted is null
-        order by 1;
+        SELECT DATABASE_NAME 
+        FROM INFORMATION_SCHEMA.DATABASES 
+        WHERE IS_TRANSIENT = 'NO'
+        ORDER BY DATABASE_NAME;
         """.lstrip()
 
         with self._engine.connect() as conn:
@@ -63,10 +62,10 @@ class QueryMetricsCollector(SnowflakeDataCollector):
             return df.to_dict(orient='records')
 
     def get_expensive_queries_paginated(self, days: int = 7,
-                                        min_execution_time: float = 60.0,
-                                        limit: int = 100,
-                                        page=0, page_size=20,
-                                        db_schema_filter=''):
+                                      min_execution_time: float = 60.0,
+                                      limit: int = 100,
+                                      page=0, page_size=20,
+                                      db_schema_filter=''):
         df = self.get_expensive_queries(days, min_execution_time, limit, db_schema_filter)
         start_idx = page * page_size
         end_idx = start_idx + page_size
@@ -94,38 +93,15 @@ class QueryMetricsCollector(SnowflakeDataCollector):
             DataFrame containing query metrics
         """
         if db_schema_filter != '':
-            db_schemas_filter_cte = f"""
-                ,access_history_by_qid as (
-                    select query_id, base_objects_accessed, direct_objects_accessed
-                    from snowflake.account_usage.access_history
-                ),
-                object_accessed as (
-                    select distinct query_id
-                    from (
-                        (
-                            select query_id, doa.value:"objectName"::string as table_name,
-                            from access_history_by_qid,
-                            lateral flatten(direct_objects_accessed) doa
-                        )
-                        union all
-                        (
-                            select query_id, boa.value:"objectName"::string as table_name,
-                            from access_history_by_qid,
-                            lateral flatten(base_objects_accessed) boa
-                        )
-                    )
-                    where table_name like '{db_schema_filter}%'
-                )
-            """
-            db_schemas_filter_join = 'AND EXISTS (SELECT 1 FROM object_accessed oa WHERE rq.query_id = oa.query_id)'
+            db_schemas_filter_condition = f"AND (DATABASE_NAME || '.' || SCHEMA_NAME) LIKE '{db_schema_filter}%'"
         else:
-            db_schemas_filter_cte = ''
-            db_schemas_filter_join = ''
+            db_schemas_filter_condition = ''
+            
         query = f"""WITH RankedQueries AS (
             SELECT 
                 QUERY_ID,
                 QUERY_TEXT,
-                QUERY_HASH,
+                '' AS QUERY_HASH,  -- INFORMATION_SCHEMA doesn't provide query hash
                 USER_NAME,
                 DATABASE_NAME,
                 SCHEMA_NAME,
@@ -142,19 +118,18 @@ class QueryMetricsCollector(SnowflakeDataCollector):
                 PARTITIONS_TOTAL,
                 BYTES_SPILLED_TO_LOCAL_STORAGE / 1024 / 1024 AS MB_SPILLED_TO_LOCAL,
                 BYTES_SPILLED_TO_REMOTE_STORAGE / 1024 / 1024 AS MB_SPILLED_TO_REMOTE,
-                ROW_NUMBER() OVER (PARTITION BY QUERY_HASH ORDER BY START_TIME DESC) AS RN
-            FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY
+                ROW_NUMBER() OVER (PARTITION BY QUERY_TEXT ORDER BY START_TIME DESC) AS RN
+            FROM INFORMATION_SCHEMA.QUERY_HISTORY
             WHERE 
                 TOTAL_ELAPSED_TIME >= {min_execution_time * 1000}
                 AND START_TIME >= DATEADD('days', -{days}, CURRENT_TIMESTAMP())
                 AND EXECUTION_STATUS = 'SUCCESS'
                 AND QUERY_TYPE = 'SELECT'
+                {db_schemas_filter_condition}
         )
-        {db_schemas_filter_cte}
         SELECT rq.*
         FROM RankedQueries rq
         WHERE RN = 1
-        {db_schemas_filter_join}
         ORDER BY EXECUTION_TIME_SECONDS DESC
         LIMIT {limit};"""
 
@@ -170,19 +145,22 @@ class QueryMetricsCollector(SnowflakeDataCollector):
         """
         Fetch impacted objects metadata by query_id
 
-         Args:
+        Args:
             query_id: The Snowflake query ID
 
         Returns:
-            Dictionary containing the objects metadata
+            DataFrame containing the objects metadata
         """
         query = f"""
-            select
-                boa.value:"objectName"::string as table_name
-            from snowflake.account_usage.access_history
-            , lateral flatten(base_objects_accessed) boa
-            where query_id = '{query_id}'
-            and  boa.value:"objectDomain"::string='Table';"""
+            SELECT DISTINCT OBJECT_NAME AS table_name
+            FROM INFORMATION_SCHEMA.OBJECT_DEPENDENCIES
+            WHERE REFERENCED_OBJECT_ID IN (
+                SELECT OBJECT_ID 
+                FROM INFORMATION_SCHEMA.QUERY_HISTORY 
+                WHERE QUERY_ID = '{query_id}'
+            )
+            AND OBJECT_TYPE = 'TABLE';
+        """
         with _self._engine.connect() as conn:
             df = pd.read_sql(query, conn)
         return df
@@ -192,54 +170,60 @@ class QueryMetricsCollector(SnowflakeDataCollector):
         """
         Fetch impacted objects metadata by query_id
 
-         Args:
+        Args:
             impacted_objects: The Snowflake impacted objects
 
         Returns:
-            Dictionary containing the objects metadata
+            List of SchemaInfo containing the objects metadata
         """
         metadata = []
         for _, row in impacted_objects.iterrows():
-            object_name = row.iloc[0]
-            table_catalog, table_schema, table_name = object_name.split('.')
-            # desc_query = f"""DESC TABLE {object_name}"""
+            object_name = row['table_name']
+            try:
+                table_catalog, table_schema, table_name = object_name.split('.')
+            except ValueError:
+                print(f"Invalid object name format: {object_name}")
+                continue
+                
             desc_query = f"""
-                SELECT COLUMN_NAME, DATA_TYPE::VARIANT as DATA_TYPE
-                FROM SNOWFLAKE.ACCOUNT_USAGE.COLUMNS 
+                SELECT COLUMN_NAME, DATA_TYPE
+                FROM INFORMATION_SCHEMA.COLUMNS 
                 WHERE 
-                TABLE_CATALOG = '{table_catalog}' AND
-                TABLE_SCHEMA = '{table_schema}' AND
-                TABLE_NAME = '{table_name}'
-                AND DELETED IS NULL;
-                """
+                    TABLE_CATALOG = '{table_catalog}' 
+                    AND TABLE_SCHEMA = '{table_schema}' 
+                    AND TABLE_NAME = '{table_name}';
+            """
             try:
                 with _self._engine.connect() as conn:
                     columns_dict = pd.read_sql(desc_query, conn).to_dict(orient="records")
-                    columns_dict = [ColumnInfo(column_name=column['column_name'], column_type=column['data_type']) for
-                                    column in columns_dict]
+                    columns_dict = [ColumnInfo(column_name=column['COLUMN_NAME'], column_type=column['DATA_TYPE']) for
+                                  column in columns_dict]
+            except Exception as e:
+                print(f"No metadata for object: {object_name} in INFORMATION_SCHEMA.COLUMNS: {str(e)}")
+                columns_dict = []
 
-            except:
-                print(f"No metadata for object: {object_name} in SNOWFLAKE.ACCOUNT_USAGE.COLUMNS")
             try:
-                table_catalog, table_schema, table_name = object_name.split('.')
                 query = f"""
                     SELECT ROW_COUNT, BYTES
-                    FROM SNOWFLAKE.ACCOUNT_USAGE.TABLES 
+                    FROM INFORMATION_SCHEMA.TABLES 
                     WHERE
-                    table_name = '{table_name}' AND
-                    table_schema = '{table_schema}' AND
-                    table_catalog = '{table_catalog}' AND
-                    DELETED is NULL;
-                    """
+                        TABLE_CATALOG = '{table_catalog}' 
+                        AND TABLE_SCHEMA = '{table_schema}' 
+                        AND TABLE_NAME = '{table_name}';
+                """
                 with _self._engine.connect() as conn:
-                    metadata_dict = pd.read_sql(query, conn).to_dict(orient="records")[0]
-            except:
-                print(f"No metadata for object: {object_name} in SNOWFLAKE.ACCOUNT_USAGE.TABLES")
+                    metadata_dict = pd.read_sql(query, conn).to_dict(orient="records")
+                    metadata_dict = metadata_dict[0] if metadata_dict else {}
+            except Exception as e:
+                print(f"No metadata for object: {object_name} in INFORMATION_SCHEMA.TABLES: {str(e)}")
+                metadata_dict = {}
 
-            metadata.append(SchemaInfo(table_name=object_name,
-                                       columns=columns_dict,
-                                       row_count=metadata_dict.get("row_count"),
-                                       size_bytes=metadata_dict.get("bytes")))
+            metadata ACO.append(SchemaInfo(
+                table_name=object_name,
+                columns=columns_dict,
+                row_count=metadata_dict.get("ROW_COUNT", 0),
+                size_bytes=metadata_dict.get("BYTES", 0)
+            ))
         return metadata
 
     def get_query_plan(self, query_id: str) -> Dict[str, Any]:
@@ -260,10 +244,10 @@ class QueryMetricsCollector(SnowflakeDataCollector):
 
 class SnowflakeQueryExecutor(SnowflakeDataCollector):
     def execute_query_in_transaction(self, query: str = None,
-                                     snowpark_job: Callable[[Session], Any] = None,
-                                     action_on_complete: Literal["commit", "rollback"] = 'rollback') -> DataFrame:
+                                   snowpark_job: Callable[[Session], Any] = None,
+                                   action_on_complete: Literal["commit", "rollback"] = 'rollback') -> DataFrame:
         with SnowflakeSessionTransaction(session_gen=self._snowpark_session_generator,
-                                         action_on_complete=action_on_complete) as session:
+                                       action_on_complete=action_on_complete) as session:
             if query:
                 return session.sql(query)
             elif snowpark_job:
